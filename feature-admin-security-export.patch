@@ -1,0 +1,1871 @@
+*** Begin Patch
+*** Add File: .env.example
++DATABASE_URL=postgres://postgres:postgres@localhost:5432/resto?sslmode=disable
++JWT_SECRET=change-me-to-a-strong-secret
++FRONTEND_URL=http://localhost:3000
++ALLOW_ORIGIN=http://localhost:3000
++ENV=development
++ALLOW_INSECURE_COOKIES=1
++IMG_ROOT=./frontend/public
++
++# SMTP (optional)
++SMTP_HOST=smtp.example.com
++SMTP_PORT=587
++SMTP_USER=user@example.com
++SMTP_PASS=verysecret
++SMTP_FROM=notifications@example.com
++
++# Twilio (optional)
++TWILIO_SID=
++TWILIO_TOKEN=
++TWILIO_FROM=
++
++# AWS (for S3 fetch/upload)
++AWS_REGION=us-east-1
++AWS_ACCESS_KEY_ID=
++AWS_SECRET_ACCESS_KEY=
++AWS_SESSION_TOKEN=
++
++# Frontend
++REACT_APP_API_URL=http://localhost:8080/api
++REACT_APP_DEFAULT_RESTAURANT=1
+*** End Patch
+*** Begin Patch
+*** Add File: docker-compose.yml
++version: "3.8"
++services:
++  db:
++    image: postgres:15
++    environment:
++      POSTGRES_USER: postgres
++      POSTGRES_PASSWORD: postgres
++      POSTGRES_DB: resto
++    volumes:
++      - db-data:/var/lib/postgresql/data
++      - ./db:/docker-entrypoint-initdb.d
++    ports:
++      - "5432:5432"
++
++  backend:
++    build:
++      context: ./backend
++      dockerfile: Dockerfile
++    environment:
++      - DATABASE_URL=postgres://postgres:postgres@db:5432/resto?sslmode=disable
++      - JWT_SECRET=some-dev-secret
++      - FRONTEND_URL=http://localhost:3000
++      - ALLOW_ORIGIN=http://localhost:3000
++      - ENV=development
++      - ALLOW_INSECURE_COOKIES=1
++      - IMG_ROOT=/app/frontend/public
++    ports:
++      - "8080:8080"
++    depends_on:
++      - db
++    volumes:
++      - ./frontend/public:/app/frontend/public:ro
++
++  frontend:
++    build:
++      context: ./frontend
++      dockerfile: Dockerfile
++    environment:
++      - REACT_APP_API_URL=http://localhost:8080/api
++      - REACT_APP_DEFAULT_RESTAURANT=1
++    ports:
++      - "3000:3000"
++    depends_on:
++      - backend
++
++  cleanup-worker:
++    build:
++      context: .
++      dockerfile: Dockerfile.worker
++    environment:
++      - DATABASE_URL=postgres://postgres:postgres@db:5432/resto?sslmode=disable
++    depends_on:
++      - db
++    restart: unless-stopped
++
++volumes:
++  db-data:
+*** End Patch
+*** Begin Patch
+*** Add File: backend/Dockerfile
++FROM golang:1.20-alpine AS builder
++WORKDIR /app
++COPY go.mod go.sum ./
++RUN go mod download
++COPY . .
++RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /restaurant-backend ./...
++
++FROM alpine:3.18
++RUN apk add --no-cache ca-certificates
++COPY --from=builder /restaurant-backend /usr/local/bin/restaurant-backend
++EXPOSE 8080
++ENV PORT=8080
++CMD ["/usr/local/bin/restaurant-backend"]
+*** End Patch
+*** Begin Patch
+*** Add File: frontend/Dockerfile
++FROM node:18-alpine AS builder
++WORKDIR /app
++COPY package.json package-lock.json ./
++RUN npm ci
++COPY . .
++RUN npm run build
++
++FROM nginx:stable-alpine
++COPY --from=builder /app/build /usr/share/nginx/html
++EXPOSE 3000
++CMD ["nginx", "-g", "daemon off;"]
+*** End Patch
+*** Begin Patch
+*** Add File: Dockerfile.worker
++FROM golang:1.20-alpine AS builder
++WORKDIR /app
++COPY scripts ./scripts
++RUN apk add --no-cache git
++RUN go env -w GOPROXY=https://proxy.golang.org
++RUN go build -o /bin/cleanup scripts/cleanup_refresh_tokens.go
++
++FROM alpine:3.18
++RUN apk add --no-cache bash ca-certificates
++COPY --from=builder /bin/cleanup /usr/local/bin/cleanup
++COPY scripts/run_cleanup_loop.sh /usr/local/bin/run_cleanup_loop.sh
++RUN chmod +x /usr/local/bin/run_cleanup_loop.sh
++CMD ["/usr/local/bin/run_cleanup_loop.sh"]
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/run_migrations.sh
++#!/usr/bin/env bash
++set -e
++DB_URL="${DATABASE_URL:-postgres://postgres:postgres@localhost:5432/resto?sslmode=disable}"
++echo "Running migrations against $DB_URL"
++for f in $(ls db/*.sql | sort); do
++  echo "Applying $f"
++  psql "$DB_URL" -f "$f"
++done
++echo "Migrations applied."
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/create_admin.go
++package main
++
++// Usage:
++// go run scripts/create_admin.go --restaurant 1 --email owner@example.com --password 'StrongPass123' --role owner
++
++import (
++	"database/sql"
++	"flag"
++	"fmt"
++	"log"
++	"os"
++
++	"golang.org/x/crypto/bcrypt"
++	_ "github.com/lib/pq"
++)
++
++func main() {
++	restaurant := flag.Int("restaurant", 0, "restaurant id")
++	email := flag.String("email", "", "admin email")
++	password := flag.String("password", "", "password in plain (will be hashed)")
++	role := flag.String("role", "chef", "role (chef|owner)")
++	flag.Parse()
++
++	if *restaurant == 0 || *email == "" || *password == "" {
++		flag.Usage()
++		os.Exit(2)
++	}
++
++	dbURL := os.Getenv("DATABASE_URL")
++	if dbURL == "" {
++		dbURL = "postgres://postgres:postgres@localhost:5432/resto?sslmode=disable"
++	}
++
++	db, err := sql.Open("postgres", dbURL)
++	if err != nil {
++		log.Fatalf("open db: %v", err)
++	}
++	defer db.Close()
++
++	hash, err := bcrypt.GenerateFromPassword([]byte(*password), bcrypt.DefaultCost)
++	if err != nil {
++		log.Fatalf("bcrypt: %v", err)
++	}
++
++	perms := "[]"
++	_, err = db.Exec(`INSERT INTO admins (restaurant_id, email, password_hash, role, permissions) VALUES ($1,$2,$3,$4,$5)
++	ON CONFLICT (restaurant_id, email) DO UPDATE SET password_hash=EXCLUDED.password_hash, role=EXCLUDED.role, permissions=EXCLUDED.permissions`,
++		*restaurant, *email, string(hash), *role, perms)
++	if err != nil {
++		log.Fatalf("insert admin: %v", err)
++	}
++	fmt.Printf("Admin %s@restaurant:%d (%s) created/updated\n", *email, *restaurant, *role)
++}
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/cleanup_refresh_tokens.go
++package main
++
++// Usage: go run scripts/cleanup_refresh_tokens.go --retention 30
++// Deletes revoked or expired refresh tokens older than retention days.
++
++import (
++	"database/sql"
++	"flag"
++	"fmt"
++	"log"
++	"os"
++	"time"
++
++	_ "github.com/lib/pq"
++)
++
++func main() {
++	retention := flag.Int("retention", 30, "retention days for revoked/expired refresh tokens")
++	flag.Parse()
++
++	dbURL := os.Getenv("DATABASE_URL")
++	if dbURL == "" {
++		dbURL = "postgres://postgres:postgres@localhost:5432/resto?sslmode=disable"
++	}
++	db, err := sql.Open("postgres", dbURL)
++	if err != nil {
++		log.Fatalf("open db: %v", err)
++	}
++	defer db.Close()
++
++	threshold := time.Now().AddDate(0, 0, -*retention)
++	res, err := db.Exec(`DELETE FROM refresh_tokens WHERE (revoked = true AND created_at < $1) OR (expires_at IS NOT NULL AND expires_at < $1)`, threshold)
++	if err != nil {
++		log.Fatalf("cleanup failed: %v", err)
++	}
++	n, _ := res.RowsAffected()
++	fmt.Printf("Cleaned up %d refresh token(s) older than %d days\n", n, *retention)
++}
+*** End Patch
+*** Begin Patch
+*** Add File: scripts/run_cleanup_loop.sh
++#!/usr/bin/env sh
++if [ -z "$DATABASE_URL" ]; then
++  echo "DATABASE_URL not set; exiting"
++  exit 1
++fi
++
++while true; do
++  echo "Running cleanup at $(date -u)"
++  /usr/local/bin/cleanup --retention 30 || echo "cleanup failed"
++  sleep 86400
++done
+*** End Patch
+*** Begin Patch
+*** Add File: Makefile
++.PHONY: up migrate create-admin cleanup-sessions run-cleanup-loop
++
++up:
++	docker-compose up --build
++
++migrate:
++	DATABASE_URL=${DATABASE_URL} ./scripts/run_migrations.sh
++
++create-admin:
++	go run scripts/create_admin.go --restaurant ${RESTAURANT_ID} --email ${ADMIN_EMAIL} --password ${ADMIN_PASSWORD} --role ${ADMIN_ROLE}
++
++cleanup-sessions:
++	go run scripts/cleanup_refresh_tokens.go --retention 30
++
++run-cleanup-loop:
++	docker-compose run --rm cleanup-worker
+*** End Patch
+*** Begin Patch
+*** Add File: db/migrations.sql
++-- Base schema and sample data (initial)
++DROP TABLE IF EXISTS admins;
++DROP TABLE IF EXISTS subscribers;
++DROP TABLE IF EXISTS orders;
++DROP TABLE IF EXISTS reviews;
++DROP TABLE IF EXISTS galleries;
++DROP TABLE IF EXISTS menus;
++DROP TABLE IF EXISTS restaurants;
++
++CREATE TABLE restaurants (
++  id SERIAL PRIMARY KEY,
++  name TEXT,
++  story TEXT,
++  address TEXT,
++  phone TEXT,
++  email TEXT,
++  hours TEXT,
++  social_links JSONB DEFAULT '[]',
++  offerings JSONB DEFAULT '[]',
++  site_config JSONB DEFAULT '{}'
++);
++
++CREATE TABLE menus (
++  id SERIAL PRIMARY KEY,
++  restaurant_id INT REFERENCES restaurants(id),
++  category TEXT,
++  items_json JSONB,
++  UNIQUE(restaurant_id, category)
++);
++
++CREATE TABLE galleries (
++  id SERIAL PRIMARY KEY,
++  restaurant_id INT REFERENCES restaurants(id) UNIQUE,
++  images JSONB DEFAULT '[]',
++  captions JSONB DEFAULT '[]'
++);
++
++CREATE TABLE reviews (
++  id SERIAL PRIMARY KEY,
++  restaurant_id INT REFERENCES restaurants(id) UNIQUE,
++  testimonials JSONB DEFAULT '[]'
++);
++
++CREATE TABLE orders (
++  id SERIAL PRIMARY KEY,
++  restaurant_id INT REFERENCES restaurants(id),
++  items_json JSONB,
++  total NUMERIC(10,2),
++  status TEXT,
++  created_at TIMESTAMP WITH TIME ZONE,
++  customer_name TEXT,
++  customer_phone TEXT,
++  customer_address TEXT,
++  customer_email TEXT,
++  notes TEXT
++);
++
++CREATE TABLE subscribers (
++  id SERIAL PRIMARY KEY,
++  restaurant_id INT REFERENCES restaurants(id),
++  email TEXT UNIQUE
++);
++
++CREATE TABLE admins (
++  id SERIAL PRIMARY KEY,
++  restaurant_id INT REFERENCES restaurants(id),
++  email TEXT,
++  password_hash TEXT,
++  role TEXT,
++  permissions JSONB
++);
++
++-- Seed sample restaurant
++INSERT INTO restaurants (id, name, story, address, phone, email, hours, social_links, offerings, site_config)
++VALUES (
++  1,
++  'Sample Restaurant',
++  'We are a family-run kitchen serving seasonal dishes with a local twist.',
++  '123 Food St, Cityville',
++  '+15551234567',
++  'owner@sample.com',
++  'Mon-Sun 11:00-22:00',
++  '["https://instagram.com/sample","https://facebook.com/sample"]',
++  '["Brunch","Dinner","Delivery"]',
++  '{"showGallery": true, "enableOrdering": true, "themeColor":"#c0392b", "seoTitle":"Sample Restaurant", "seoDesc":"Local, seasonal dishes"}'
++);
++
++INSERT INTO menus (restaurant_id, category, items_json) VALUES
++(1, 'Appetizers', '[{"name":"Sample Salad","desc":"Fresh greens","price":10.00,"img":"/img/salad.jpg","available":true},{"name":"Garlic Bread","desc":"Toasted with herbs","price":5.50,"img":"/img/garlic.jpg","available":true}]'),
++(1, 'Mains', '[{"name":"Grilled Fish","desc":"Daily catch","price":18.00,"img":"/img/fish.jpg","available":true},{"name":"Pasta","desc":"House sauce","price":15.00,"img":"/img/pasta.jpg","available":true}]');
++
++INSERT INTO galleries (restaurant_id, images, captions) VALUES
++(1, '["/img/hero.jpg","/img/dish1.jpg"]', '["Our entry","Signature dish"]');
++
++INSERT INTO reviews (restaurant_id, testimonials) VALUES
++(1, '[{"name":"John","rating":5,"comment":"Amazing food!","date":"2025-01-01T12:00:00Z"}]');
+*** End Patch
+*** Begin Patch
+*** Add File: db/admin_onboarding_migrations.sql
++CREATE TABLE IF NOT EXISTS admin_invitations (
++  id SERIAL PRIMARY KEY,
++  restaurant_id INT REFERENCES restaurants(id),
++  email TEXT NOT NULL,
++  role TEXT NOT NULL,
++  token TEXT NOT NULL UNIQUE,
++  created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
++  expires_at TIMESTAMP WITH TIME ZONE,
++  accepted_at TIMESTAMP WITH TIME ZONE,
++  accepted_by INT
++);
++
++CREATE TABLE IF NOT EXISTS password_resets (
++  id SERIAL PRIMARY KEY,
++  admin_email TEXT NOT NULL,
++  token TEXT NOT NULL UNIQUE,
++  created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
++  expires_at TIMESTAMP WITH TIME ZONE,
++  used_at TIMESTAMP WITH TIME ZONE
++);
++
++CREATE TABLE IF NOT EXISTS audit_log (
++  id SERIAL PRIMARY KEY,
++  restaurant_id INT REFERENCES restaurants(id),
++  admin_email TEXT,
++  action TEXT NOT NULL,
++  payload JSONB,
++  ip TEXT,
++  created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
++);
++
++CREATE INDEX IF NOT EXISTS idx_admin_invitations_token ON admin_invitations(token);
+*** End Patch
+*** Begin Patch
+*** Add File: db/password_reset_migration.sql
++CREATE TABLE IF NOT EXISTS password_resets (
++  id SERIAL PRIMARY KEY,
++  admin_email TEXT NOT NULL,
++  token TEXT NOT NULL UNIQUE,
++  created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
++  expires_at TIMESTAMP WITH TIME ZONE,
++  used_at TIMESTAMP WITH TIME ZONE
++);
++
++CREATE INDEX IF NOT EXISTS idx_password_resets_token ON password_resets(token);
++CREATE INDEX IF NOT EXISTS idx_password_resets_email ON password_resets(admin_email);
+*** End Patch
+*** Begin Patch
+*** Add File: db/refresh_tokens_migration.sql
++CREATE TABLE IF NOT EXISTS refresh_tokens (
++  id SERIAL PRIMARY KEY,
++  restaurant_id INT REFERENCES restaurants(id),
++  admin_email TEXT NOT NULL,
++  token_hash TEXT NOT NULL UNIQUE,
++  created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
++  expires_at TIMESTAMP WITH TIME ZONE,
++  revoked BOOLEAN DEFAULT FALSE,
++  ip TEXT,
++  user_agent TEXT
++);
++
++CREATE INDEX IF NOT EXISTS idx_refresh_tokens_token_hash ON refresh_tokens(token_hash);
++CREATE INDEX IF NOT EXISTS idx_refresh_tokens_email ON refresh_tokens(admin_email);
+*** End Patch
+*** Begin Patch
+*** Add File: backend/go.mod
++module github.com/yourname/restaurant-site-backend
++
++go 1.20
++
++require (
++	github.com/aws/aws-sdk-go-v2 v1.28.0
++	github.com/aws/aws-sdk-go-v2/config v1.28.0
++	github.com/aws/aws-sdk-go-v2/service/s3 v1.28.0
++	github.com/golang-jwt/jwt/v4 v4.4.4
++	github.com/lib/pq v1.10.11
++	github.com/rs/cors v1.8.2
++	golang.org/x/crypto v0.12.0
++)
+*** End Patch
+*** Begin Patch
+*** Add File: backend/refresh_tokens.go
++package main
++
++import (
++	"context"
++	"crypto/rand"
++	"crypto/sha256"
++	"database/sql"
++	"encoding/hex"
++	"time"
++)
++
++func generateRandomToken(n int) (string, error) {
++	b := make([]byte, n)
++	_, err := rand.Read(b)
++	if err != nil {
++		return "", err
++	}
++	return hex.EncodeToString(b), nil
++}
++
++func hashToken(raw string) string {
++	h := sha256.Sum256([]byte(raw))
++	return hex.EncodeToString(h[:])
++}
++
++func (s *Store) CreateRefreshToken(ctx context.Context, restaurantID int, email, ip, ua string, expiresIn time.Duration) (rawToken string, insertedID int, err error) {
++	raw, err := generateRandomToken(32)
++	if err != nil {
++		return "", 0, err
++	}
++	hash := hashToken(raw)
++	expires := time.Now().Add(expiresIn)
++
++	var id int
++	err = s.DB.QueryRowContext(ctx, "INSERT INTO refresh_tokens (restaurant_id, admin_email, token_hash, created_at, expires_at, ip, user_agent, revoked) VALUES ($1,$2,$3,$4,$5,$6,$7,false) RETURNING id",
++		restaurantID, email, hash, time.Now(), expires, ip, ua).Scan(&id)
++	if err != nil {
++		return "", 0, err
++	}
++	return raw, id, nil
++}
++
++type RefreshRow struct {
++	ID           int
++	RestaurantID int
++	Email        string
++	CreatedAt    time.Time
++	ExpiresAt    sql.NullTime
++	Revoked      bool
++	IP           string
++	UserAgent    string
++}
++
++func (s *Store) FindRefreshToken(ctx context.Context, raw string) (RefreshRow, error) {
++	var out RefreshRow
++	hash := hashToken(raw)
++	row := s.DB.QueryRowContext(ctx, "SELECT id, restaurant_id, admin_email, created_at, expires_at, revoked, ip, user_agent FROM refresh_tokens WHERE token_hash=$1", hash)
++	if err := row.Scan(&out.ID, &out.RestaurantID, &out.Email, &out.CreatedAt, &out.ExpiresAt, &out.Revoked, &out.IP, &out.UserAgent); err != nil {
++		return out, err
++	}
++	return out, nil
++}
++
++func (s *Store) RevokeRefreshTokenByID(ctx context.Context, id int) error {
++	_, err := s.DB.ExecContext(ctx, "UPDATE refresh_tokens SET revoked=true WHERE id=$1", id)
++	return err
++}
++
++func (s *Store) RevokeRefreshTokenByRaw(ctx context.Context, raw string) error {
++	hash := hashToken(raw)
++	_, err := s.DB.ExecContext(ctx, "UPDATE refresh_tokens SET revoked=true WHERE token_hash=$1", hash)
++	return err
++}
++
++func (s *Store) RotateRefreshToken(ctx context.Context, oldRaw string, ip, ua string, expiresIn time.Duration) (newRaw string, newID int, err error) {
++	found, err := s.FindRefreshToken(ctx, oldRaw)
++	if err != nil {
++		return "", 0, err
++	}
++	_ = s.RevokeRefreshTokenByID(ctx, found.ID)
++	newRaw, newID, err = s.CreateRefreshToken(ctx, found.RestaurantID, found.Email, ip, ua, expiresIn)
++	if err != nil {
++		return "", 0, err
++	}
++	return newRaw, newID, nil
++}
++
++func (s *Store) ListRefreshTokens(ctx context.Context, restaurantID int, emailFilter *string, limit int) ([]RefreshRow, error) {
++	if limit <= 0 {
++		limit = 200
++	}
++	var rows *sql.Rows
++	var err error
++	if emailFilter == nil {
++		rows, err = s.DB.QueryContext(ctx, "SELECT id, restaurant_id, admin_email, created_at, expires_at, revoked, ip, user_agent FROM refresh_tokens WHERE restaurant_id=$1 ORDER BY created_at DESC LIMIT $2", restaurantID, limit)
++	} else {
++		rows, err = s.DB.QueryContext(ctx, "SELECT id, restaurant_id, admin_email, created_at, expires_at, revoked, ip, user_agent FROM refresh_tokens WHERE restaurant_id=$1 AND admin_email=$2 ORDER BY created_at DESC LIMIT $3", restaurantID, *emailFilter, limit)
++	}
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++	var out []RefreshRow
++	for rows.Next() {
++		var r RefreshRow
++		_ = rows.Scan(&r.ID, &r.RestaurantID, &r.Email, &r.CreatedAt, &r.ExpiresAt, &r.Revoked, &r.IP, &r.UserAgent)
++		out = append(out, r)
++	}
++	return out, nil
++}
++
++func (s *Store) CleanupExpiredRevokedTokens(ctx context.Context, retentionDays int) (int64, error) {
++	threshold := time.Now().AddDate(0, 0, -retentionDays)
++	res, err := s.DB.ExecContext(ctx, "DELETE FROM refresh_tokens WHERE (revoked = true AND created_at < $1) OR (expires_at IS NOT NULL AND expires_at < $1)", threshold)
++	if err != nil {
++		return 0, err
++	}
++	return res.RowsAffected()
++}
+*** End Patch
+*** Begin Patch
+*** Add File: backend/refresh_handlers.go
++package main
++
++import (
++	"fmt"
++	"net/http"
++	"os"
++	"time"
++
++	"github.com/golang-jwt/jwt/v4"
++)
++
++const RefreshCookieName = "refresh_token"
++
++var (
++	RefreshTokenDuration = 30 * 24 * time.Hour
++	AccessTokenTTL       = 15 * time.Minute
++)
++
++func cookieIsSecure() bool {
++	if os.Getenv("ALLOW_INSECURE_COOKIES") == "1" {
++		return false
++	}
++	return os.Getenv("ENV") == "production"
++}
++
++func setRefreshCookie(w http.ResponseWriter, token string, expires time.Time) {
++	secure := cookieIsSecure()
++	c := &http.Cookie{
++		Name:     RefreshCookieName,
++		Value:    token,
++		Path:     "/",
++		HttpOnly: true,
++		Secure:   secure,
++		SameSite: http.SameSiteStrictMode,
++		Expires:  expires,
++	}
++	http.SetCookie(w, c)
++}
++
++func clearRefreshCookie(w http.ResponseWriter) {
++	c := &http.Cookie{
++		Name:     RefreshCookieName,
++		Value:    "",
++		Path:     "/",
++		HttpOnly: true,
++		Secure:   cookieIsSecure(),
++		SameSite: http.SameSiteStrictMode,
++		Expires:  time.Unix(0, 0),
++		MaxAge:   -1,
++	}
++	http.SetCookie(w, c)
++}
++
++func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost && r.Method != http.MethodGet {
++		http.Error(w, "only GET/POST allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	c, err := r.Cookie(RefreshCookieName)
++	if err != nil {
++		http.Error(w, "no refresh token", http.StatusUnauthorized)
++		return
++	}
++	raw := c.Value
++	found, err := s.store.FindRefreshToken(r.Context(), raw)
++	if err != nil {
++		http.Error(w, "invalid refresh token", http.StatusUnauthorized)
++		return
++	}
++	if found.Revoked {
++		http.Error(w, "token revoked", http.StatusUnauthorized)
++		return
++	}
++	if found.ExpiresAt.Valid && time.Now().After(found.ExpiresAt.Time) {
++		http.Error(w, "token expired", http.StatusUnauthorized)
++		return
++	}
++	admin, err := s.store.GetAdminByEmail(r.Context(), found.RestaurantID, found.Email)
++	if err != nil {
++		http.Error(w, "admin not found", http.StatusUnauthorized)
++		return
++	}
++	accessToken, err := createTokenWithTTL(admin, AccessTokenTTL)
++	if err != nil {
++		http.Error(w, "failed to create access token", http.StatusInternalServerError)
++		return
++	}
++	newRaw, newID, err := s.store.RotateRefreshToken(r.Context(), raw, r.RemoteAddr, r.UserAgent(), RefreshTokenDuration)
++	if err != nil {
++		fmt.Println("refresh rotation failed:", err)
++		writeJSON(w, map[string]any{"accessToken": accessToken, "role": admin.Role, "expiresIn": int(AccessTokenTTL.Seconds()), "currentSessionId": found.ID})
++		return
++	}
++	setRefreshCookie(w, newRaw, time.Now().Add(RefreshTokenDuration))
++	writeJSON(w, map[string]any{"accessToken": accessToken, "role": admin.Role, "expiresIn": int(AccessTokenTTL.Seconds()), "currentSessionId": newID})
++}
++
++func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	c, err := r.Cookie(RefreshCookieName)
++	if err == nil {
++		found, errFind := s.store.FindRefreshToken(r.Context(), c.Value)
++		if errFind == nil {
++			_ = s.store.RevokeRefreshTokenByID(r.Context(), found.ID)
++			_ = insertAuditLog(r.Context(), s.store.DB, found.RestaurantID, found.Email, "session_revoked_by_user", map[string]any{"session_id": found.ID}, r.RemoteAddr)
++		} else {
++			_ = s.store.RevokeRefreshTokenByRaw(r.Context(), c.Value)
++		}
++	}
++	clearRefreshCookie(w)
++	writeJSON(w, map[string]any{"ok": true})
++}
++
++func createTokenWithTTL(admin AdminUser, ttl time.Duration) (string, error) {
++	secret := os.Getenv("JWT_SECRET")
++	if secret == "" {
++		secret = "dev-secret"
++	}
++	claims := jwt.MapClaims{
++		"restaurantId": admin.RestaurantID,
++		"email":        admin.Email,
++		"role":         admin.Role,
++		"exp":          time.Now().Add(ttl).Unix(),
++		"iat":          time.Now().Unix(),
++	}
++	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
++	return token.SignedString([]byte(secret))
++}
+*** End Patch
+*** Begin Patch
+*** Add File: backend/invite_handlers.go
++package main
++
++import (
++	"context"
++	"crypto/rand"
++	"database/sql"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"os"
++	"time"
++
++	"golang.org/x/crypto/bcrypt"
++
++	"github.com/golang-jwt/jwt/v4"
++)
++
++func generateToken(n int) (string, error) {
++	b := make([]byte, n)
++	_, err := rand.Read(b)
++	if err != nil {
++		return "", err
++	}
++	return hex.EncodeToString(b), nil
++}
++
++func (s *Server) handleInviteAdmin(w http.ResponseWriter, r *http.Request, claims jwt.MapClaims) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "only POST", http.StatusMethodNotAllowed)
++		return
++	}
++	role, _ := claims["role"].(string)
++	if role != "owner" {
++		http.Error(w, "forbidden", http.StatusForbidden)
++		return
++	}
++
++	restIdFromToken := 0
++	if v, ok := claims["restaurantId"].(float64); ok {
++		restIdFromToken = int(v)
++	}
++	restaurantId, err := getIDFromPath("/api/admin/invite/", r.URL.Path)
++	if err != nil || restaurantId == 0 {
++		http.Error(w, "invalid restaurant id in path", http.StatusBadRequest)
++		return
++	}
++	if restIdFromToken != 0 && restIdFromToken != restaurantId {
++		http.Error(w, "token restaurant mismatch", http.StatusForbidden)
++		return
++	}
++
++	var payload struct {
++		Email string `json:"email"`
++		Role  string `json:"role"`
++	}
++	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.Email == "" || payload.Role == "" {
++		http.Error(w, "invalid payload", http.StatusBadRequest)
++		return
++	}
++	if payload.Role != "chef" && payload.Role != "owner" {
++		http.Error(w, "invalid role", http.StatusBadRequest)
++		return
++	}
++
++	token, err := generateToken(32)
++	if err != nil {
++		http.Error(w, "failed to generate token", http.StatusInternalServerError)
++		return
++	}
++	expires := time.Now().Add(72 * time.Hour)
++
++	_, err = s.store.DB.ExecContext(r.Context(), `INSERT INTO admin_invitations (restaurant_id, email, role, token, created_at, expires_at) VALUES ($1,$2,$3,$4,$5,$6)
++		ON CONFLICT (restaurant_id, email) DO UPDATE SET token=EXCLUDED.token, created_at=EXCLUDED.created_at, expires_at=EXCLUDED.expires_at, role=EXCLUDED.role`,
++		restaurantId, payload.Email, payload.Role, token, time.Now(), expires)
++	if err != nil {
++		http.Error(w, "failed to create invite", http.StatusInternalServerError)
++		return
++	}
++
++	frontend := os.Getenv("FRONTEND_URL")
++	if frontend == "" {
++		frontend = "http://localhost:3000"
++	}
++	inviteURL := fmt.Sprintf("%s/invite/accept?token=%s&restaurantId=%d", frontend, token, restaurantId)
++	subject := "You're invited to manage the restaurant"
++	body := fmt.Sprintf("You have been invited as '%s' for restaurant ID %d.\n\nClick the link to accept and create your password (expires in 72 hours):\n\n%s", payload.Role, restaurantId, inviteURL)
++	go func() {
++		if err := sendEmail(payload.Email, subject, body); err != nil {
++			fmt.Println("failed sending invite email:", err)
++		}
++	}()
++
++	pl := map[string]any{"action": "invite_created", "invited_email": payload.Email, "role": payload.Role}
++	_ = insertAuditLog(r.Context(), s.store.DB, restaurantId, claims["email"].(string), "invite_created", pl, r.RemoteAddr)
++
++	writeJSON(w, map[string]any{"ok": true})
++}
++
++func (s *Server) handleAcceptInvite(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "only POST", http.StatusMethodNotAllowed)
++		return
++	}
++	var p struct {
++		Token    string `json:"token"`
++		Password string `json:"password"`
++	}
++	if err := json.NewDecoder(r.Body).Decode(&p); err != nil || p.Token == "" || p.Password == "" {
++		http.Error(w, "invalid payload", http.StatusBadRequest)
++		return
++	}
++	var inv struct {
++		ID           int
++		RestaurantID int
++		Email        string
++		Role         string
++		Token        string
++		ExpiresAt    sql.NullTime
++		AcceptedAt   sql.NullTime
++	}
++	row := s.store.DB.QueryRowContext(r.Context(), "SELECT id, restaurant_id, email, role, token, expires_at, accepted_at FROM admin_invitations WHERE token=$1", p.Token)
++	if err := row.Scan(&inv.ID, &inv.RestaurantID, &inv.Email, &inv.Role, &inv.Token, &inv.ExpiresAt, &inv.AcceptedAt); err != nil {
++		http.Error(w, "invalid or expired token", http.StatusBadRequest)
++		return
++	}
++	if inv.AcceptedAt.Valid {
++		http.Error(w, "invite already accepted", http.StatusBadRequest)
++		return
++	}
++	if inv.ExpiresAt.Valid && time.Now().After(inv.ExpiresAt.Time) {
++		http.Error(w, "invite expired", http.StatusBadRequest)
++		return
++	}
++
++	hash, err := bcrypt.GenerateFromPassword([]byte(p.Password), bcrypt.DefaultCost)
++	if err != nil {
++		http.Error(w, "failed to hash password", http.StatusInternalServerError)
++		return
++	}
++	perms := []string{}
++	permB, _ := json.Marshal(perms)
++	_, err = s.store.DB.ExecContext(r.Context(), "INSERT INTO admins (restaurant_id, email, password_hash, role, permissions) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (restaurant_id, email) DO UPDATE SET password_hash=EXCLUDED.password_hash, role=EXCLUDED.role, permissions=EXCLUDED.permissions",
++		inv.RestaurantID, inv.Email, string(hash), inv.Role, permB)
++	if err != nil {
++		http.Error(w, "failed to create admin", http.StatusInternalServerError)
++		return
++	}
++
++	_, _ = s.store.DB.ExecContext(r.Context(), "UPDATE admin_invitations SET accepted_at=$1 WHERE id=$2", time.Now(), inv.ID)
++	_ = insertAuditLog(r.Context(), s.store.DB, inv.RestaurantID, inv.Email, "invite_accepted", map[string]any{"invitation_id": inv.ID}, r.RemoteAddr)
++
++	go func() {
++		subject := "Your admin account is ready"
++		body := fmt.Sprintf("Hello %s. Your admin account for restaurant %d is now active. You can login at %s/restaurant/%d/admin", inv.Email, inv.RestaurantID, os.Getenv("FRONTEND_URL"), inv.RestaurantID)
++		_ = sendEmail(inv.Email, subject, body)
++	}()
++
++	writeJSON(w, map[string]any{"ok": true})
++}
++
++func insertAuditLog(ctx context.Context, db *sql.DB, restaurantID int, adminEmail string, action string, payload any, ip string) error {
++	plb, _ := json.Marshal(payload)
++	_, err := db.ExecContext(ctx, "INSERT INTO audit_log (restaurant_id, admin_email, action, payload, ip, created_at) VALUES ($1,$2,$3,$4,$5,$6)", restaurantID, adminEmail, action, plb, ip, time.Now())
++	return err
++}
+*** End Patch
+*** Begin Patch
+*** Add File: backend/password_reset_handlers.go
++package main
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"os"
++	"time"
++
++	"golang.org/x/crypto/bcrypt"
++)
++
++func (s *Server) handlePasswordResetRequest(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "only POST", http.StatusMethodNotAllowed)
++		return
++	}
++	var p struct {
++		RestaurantId int    `json:"restaurantId"`
++		Email        string `json:"email"`
++	}
++	if err := json.NewDecoder(r.Body).Decode(&p); err != nil || p.Email == "" || p.RestaurantId == 0 {
++		http.Error(w, "invalid payload", http.StatusBadRequest)
++		return
++	}
++
++	var exists bool
++	row := s.store.DB.QueryRowContext(r.Context(), "SELECT EXISTS (SELECT 1 FROM admins WHERE restaurant_id=$1 AND email=$2)", p.RestaurantId, p.Email)
++	_ = row.Scan(&exists)
++
++	if exists {
++		token, err := generateToken(32)
++		if err != nil {
++			fmt.Println("generate token failed:", err)
++			writeJSON(w, map[string]any{"ok": true})
++			return
++		}
++		expires := time.Now().Add(1 * time.Hour)
++		_, err = s.store.DB.ExecContext(r.Context(), "INSERT INTO password_resets (admin_email, token, created_at, expires_at) VALUES ($1,$2,$3,$4) ON CONFLICT (admin_email) DO UPDATE SET token=EXCLUDED.token, created_at=EXCLUDED.created_at, expires_at=EXCLUDED.expires_at, used_at=NULL",
++			p.Email, token, time.Now(), expires)
++		if err != nil {
++			fmt.Println("failed inserting password reset:", err)
++			writeJSON(w, map[string]any{"ok": true})
++			return
++		}
++
++		frontend := os.Getenv("FRONTEND_URL")
++		if frontend == "" {
++			frontend = "http://localhost:3000"
++		}
++		resetURL := fmt.Sprintf("%s/password-reset/confirm?token=%s&restaurantId=%d", frontend, token, p.RestaurantId)
++		subject := "Password reset for admin account"
++		body := fmt.Sprintf("A request to reset the admin password was made. If you requested this, click the link to set a new password (expires in 1 hour):\n\n%s\n\nIf you did not request this, ignore this email.", resetURL)
++		go func() {
++			if err := sendEmail(p.Email, subject, body); err != nil {
++				fmt.Println("password reset email failed:", err)
++			}
++		}()
++
++		_ = insertAuditLog(r.Context(), s.store.DB, p.RestaurantId, p.Email, "password_reset_requested", map[string]any{"email": p.Email}, r.RemoteAddr)
++	}
++
++	writeJSON(w, map[string]any{"ok": true})
++}
++
++func (s *Server) handlePasswordResetConfirm(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "only POST", http.StatusMethodNotAllowed)
++		return
++	}
++	var p struct {
++		Token    string `json:"token"`
++		Password string `json:"password"`
++	}
++	if err := json.NewDecoder(r.Body).Decode(&p); err != nil || p.Token == "" || p.Password == "" {
++		http.Error(w, "invalid payload", http.StatusBadRequest)
++		return
++	}
++	var pr struct {
++		ID        int
++		Email     string
++		ExpiresAt sql.NullTime
++		UsedAt    sql.NullTime
++	}
++	row := s.store.DB.QueryRowContext(r.Context(), "SELECT id, admin_email, expires_at, used_at FROM password_resets WHERE token=$1", p.Token)
++	if err := row.Scan(&pr.ID, &pr.Email, &pr.ExpiresAt, &pr.UsedAt); err != nil {
++		http.Error(w, "invalid or expired token", http.StatusBadRequest)
++		return
++	}
++	if pr.UsedAt.Valid {
++		http.Error(w, "token already used", http.StatusBadRequest)
++		return
++	}
++	if pr.ExpiresAt.Valid && time.Now().After(pr.ExpiresAt.Time) {
++		http.Error(w, "token expired", http.StatusBadRequest)
++		return
++	}
++
++	hash, err := bcrypt.GenerateFromPassword([]byte(p.Password), bcrypt.DefaultCost)
++	if err != nil {
++		http.Error(w, "failed to hash password", http.StatusInternalServerError)
++		return
++	}
++	res, err := s.store.DB.ExecContext(r.Context(), "UPDATE admins SET password_hash=$1 WHERE email=$2", string(hash), pr.Email)
++	if err != nil {
++		http.Error(w, "failed to update password", http.StatusInternalServerError)
++		return
++	}
++	rowsAffected, _ := res.RowsAffected()
++	if rowsAffected == 0 {
++		http.Error(w, "account not found", http.StatusBadRequest)
++		return
++	}
++
++	_, _ = s.store.DB.ExecContext(r.Context(), "UPDATE password_resets SET used_at=$1 WHERE id=$2", time.Now(), pr.ID)
++	var restaurantID int
++	row2 := s.store.DB.QueryRowContext(r.Context(), "SELECT restaurant_id FROM admins WHERE email=$1 LIMIT 1", pr.Email)
++	_ = row2.Scan(&restaurantID)
++
++	_ = insertAuditLog(r.Context(), s.store.DB, restaurantID, pr.Email, "password_reset_confirmed", map[string]any{"token_id": pr.ID}, r.RemoteAddr)
++	go func() {
++		subject := "Password successfully reset"
++		body := "Your admin password has been successfully reset. If you did not perform this action, please contact support."
++		_ = sendEmail(pr.Email, subject, body)
++	}()
++
++	writeJSON(w, map[string]any{"ok": true})
++}
+*** End Patch
+*** Begin Patch
+*** Add File: backend/session_handlers.go
++package main
++
++import (
++	"database/sql"
++	"encoding/json"
++	"net/http"
++	"time"
++
++	"github.com/golang-jwt/jwt/v4"
++)
++
++func (s *Server) handleGetSessions(w http.ResponseWriter, r *http.Request, claims jwt.MapClaims) {
++	if r.Method != http.MethodGet {
++		http.Error(w, "only GET allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	restaurantID, err := getIDFromPath("/api/admin/sessions/", r.URL.Path)
++	if err != nil {
++		http.Error(w, "invalid restaurant id", http.StatusBadRequest)
++		return
++	}
++
++	role, _ := claims["role"].(string)
++	requesterEmail, _ := claims["email"].(string)
++
++	var rows *sql.Rows
++	if role == "owner" {
++		rows, err = s.store.DB.QueryContext(r.Context(), "SELECT id, admin_email, created_at, expires_at, revoked, ip, user_agent FROM refresh_tokens WHERE restaurant_id=$1 ORDER BY created_at DESC LIMIT 200", restaurantID)
++	} else {
++		rows, err = s.store.DB.QueryContext(r.Context(), "SELECT id, admin_email, created_at, expires_at, revoked, ip, user_agent FROM refresh_tokens WHERE restaurant_id=$1 AND admin_email=$2 ORDER BY created_at DESC LIMIT 200", restaurantID, requesterEmail)
++	}
++	if err != nil {
++		http.Error(w, "failed to query sessions", http.StatusInternalServerError)
++		return
++	}
++	defer rows.Close()
++
++	type Sess struct {
++		ID        int        `json:"id"`
++		Email     string     `json:"adminEmail"`
++		CreatedAt time.Time  `json:"createdAt"`
++		ExpiresAt *time.Time `json:"expiresAt,omitempty"`
++		Revoked   bool       `json:"revoked"`
++		IP        string     `json:"ip"`
++		UserAgent string     `json:"userAgent"`
++	}
++
++	var out []Sess
++	for rows.Next() {
++		var srec Sess
++		var expires sql.NullTime
++		if err := rows.Scan(&srec.ID, &srec.Email, &srec.CreatedAt, &expires, &srec.Revoked, &srec.IP, &srec.UserAgent); err != nil {
++			http.Error(w, "failed to read row", http.StatusInternalServerError)
++			return
++		}
++		if expires.Valid {
++			srec.ExpiresAt = &expires.Time
++		}
++		out = append(out, srec)
++	}
++	writeJSON(w, out)
++}
++
++func (s *Server) handleRevokeSession(w http.ResponseWriter, r *http.Request, claims jwt.MapClaims) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	var p struct {
++		SessionId int `json:"sessionId"`
++	}
++	if err := json.NewDecoder(r.Body).Decode(&p); err != nil || p.SessionId == 0 {
++		http.Error(w, "invalid payload", http.StatusBadRequest)
++		return
++	}
++
++	var rec struct {
++		ID           int
++		RestaurantID int
++		Email        string
++		Revoked      bool
++	}
++	row := s.store.DB.QueryRowContext(r.Context(), "SELECT id, restaurant_id, admin_email, revoked FROM refresh_tokens WHERE id=$1", p.SessionId)
++	if err := row.Scan(&rec.ID, &rec.RestaurantID, &rec.Email, &rec.Revoked); err != nil {
++		if err == sql.ErrNoRows {
++			http.Error(w, "session not found", http.StatusNotFound)
++			return
++		}
++		http.Error(w, "server error", http.StatusInternalServerError)
++		return
++	}
++
++	role, _ := claims["role"].(string)
++	requesterEmail, _ := claims["email"].(string)
++
++	if role != "owner" && requesterEmail != rec.Email {
++		http.Error(w, "forbidden", http.StatusForbidden)
++		return
++	}
++
++	if err := s.store.RevokeRefreshTokenByID(r.Context(), rec.ID); err != nil {
++		http.Error(w, "failed to revoke", http.StatusInternalServerError)
++		return
++	}
++
++	_ = insertAuditLog(r.Context(), s.store.DB, rec.RestaurantID, requesterEmail, "session_revoked", map[string]any{"revoked_session_id": rec.ID, "revoked_for": rec.Email}, r.RemoteAddr)
++
++	writeJSON(w, map[string]any{"ok": true})
++}
++
++func (s *Server) handleRevokeAllOtherSessions(w http.ResponseWriter, r *http.Request, claims jwt.MapClaims) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
++		return
++	}
++
++	restaurantID := 0
++	if v, ok := claims["restaurantId"].(float64); ok {
++		restaurantID = int(v)
++	}
++	email, _ := claims["email"].(string)
++	if restaurantID == 0 || email == "" {
++		http.Error(w, "invalid token claims", http.StatusUnauthorized)
++		return
++	}
++
++	cookie, err := r.Cookie(RefreshCookieName)
++	var currentRaw string
++	if err == nil {
++		currentRaw = cookie.Value
++	}
++
++	var currentID int
++	if currentRaw != "" {
++		found, err := s.store.FindRefreshToken(r.Context(), currentRaw)
++		if err == nil {
++			currentID = found.ID
++		}
++	}
++
++	var res sql.Result
++	if currentID > 0 {
++		res, err = s.store.DB.ExecContext(r.Context(), "UPDATE refresh_tokens SET revoked=true WHERE restaurant_id=$1 AND admin_email=$2 AND id<>$3 AND revoked=false", restaurantID, email, currentID)
++	} else {
++		res, err = s.store.DB.ExecContext(r.Context(), "UPDATE refresh_tokens SET revoked=true WHERE restaurant_id=$1 AND admin_email=$2 AND revoked=false", restaurantID, email)
++	}
++	if err != nil {
++		http.Error(w, "failed to revoke sessions", http.StatusInternalServerError)
++		return
++	}
++	affected, _ := res.RowsAffected()
++
++	_ = insertAuditLog(r.Context(), s.store.DB, restaurantID, email, "session_revoke_other", map[string]any{"revoked_count": affected}, r.RemoteAddr)
++
++	writeJSON(w, map[string]any{"ok": true, "revoked": affected})
++}
+*** End Patch
+*** Begin Patch
+*** Add File: backend/media_export.go
++package main
++
++import (
++	"archive/zip"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"time"
++
++	"github.com/aws/aws-sdk-go-v2/config"
++	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
++	"github.com/aws/aws-sdk-go-v2/service/s3"
++	"github.com/golang-jwt/jwt/v4"
++)
++
++var sanitizeRe = regexp.MustCompile(`[^a-zA-Z0-9\-_\. ]+`)
++
++func sanitizeFilename(name string) string {
++	name = strings.TrimSpace(name)
++	name = sanitizeRe.ReplaceAllString(name, "_")
++	if len(name) > 120 {
++		ext := filepath.Ext(name)
++		name = name[:110] + ext
++	}
++	return name
++}
++
++func deriveExt(src string) string {
++	ext := filepath.Ext(src)
++	ext = strings.ToLower(ext)
++	if ext == "" || len(ext) > 6 {
++		if strings.Contains(strings.ToLower(src), "jpeg") {
++			return ".jpeg"
++		}
++		return ".jpg"
++	}
++	return ext
++}
++
++func createZipEntryName(kind string, category string, itemName string, src string, idx int) string {
++	ext := deriveExt(src)
++	base := "item"
++	if itemName != "" {
++		base = sanitizeFilename(itemName)
++	} else {
++		base = fmt.Sprintf("asset_%d", idx)
++	}
++	if kind == "menu" {
++		cat := "uncategorized"
++		if category != "" {
++			cat = sanitizeFilename(category)
++		}
++		return filepath.ToSlash(filepath.Join("menus", cat, base+ext))
++	}
++	bn := filepath.Base(src)
++	bn = sanitizeFilename(bn)
++	return filepath.ToSlash(filepath.Join("galleries", fmt.Sprintf("%02d_%s", idx, bn)))
++}
++
++func fetchToWriter(ctx context.Context, src string, writer io.Writer) error {
++	src = strings.TrimSpace(src)
++	if src == "" {
++		return errors.New("empty src")
++	}
++
++	if strings.HasPrefix(src, "s3://") {
++		trim := strings.TrimPrefix(src, "s3://")
++		parts := strings.SplitN(trim, "/", 2)
++		if len(parts) != 2 {
++			return fmt.Errorf("invalid s3 url: %s", src)
++		}
++		bucket := parts[0]
++		key := parts[1]
++
++		cfg, err := config.LoadDefaultConfig(ctx)
++		if err != nil {
++			return fmt.Errorf("aws config: %w", err)
++		}
++		client := s3.NewFromConfig(cfg)
++		out, err := client.GetObject(ctx, &s3.GetObjectInput{
++			Bucket: &bucket,
++			Key:    &key,
++		})
++		if err != nil {
++			return fmt.Errorf("s3 get object: %w", err)
++		}
++		defer out.Body.Close()
++		_, err = io.Copy(writer, out.Body)
++		return err
++	}
++
++	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
++		req, err := http.NewRequestWithContext(ctx, "GET", src, nil)
++		if err != nil {
++			return err
++		}
++		client := &http.Client{Timeout: 20 * time.Second}
++		resp, err := client.Do(req)
++		if err != nil {
++			return err
++		}
++		defer resp.Body.Close()
++		if resp.StatusCode >= 400 {
++			return fmt.Errorf("http status %d", resp.StatusCode)
++		}
++		_, err = io.Copy(writer, resp.Body)
++		return err
++	}
++
++	local := src
++	imgRoot := os.Getenv("IMG_ROOT")
++	if imgRoot == "" {
++		imgRoot = "./frontend/public"
++	}
++	if strings.HasPrefix(src, "/") {
++		local = filepath.Join(imgRoot, strings.TrimPrefix(src, "/"))
++	} else {
++		local = filepath.Join(imgRoot, src)
++	}
++	local = filepath.Clean(local)
++
++	f, err := os.Open(local)
++	if err != nil {
++		return fmt.Errorf("open local: %w", err)
++	}
++	defer f.Close()
++	_, err = io.Copy(writer, f)
++	return err
++}
++
++func (s *Server) writeZipStream(ctx context.Context, w io.Writer, images []struct {
++	Src      string
++	ZipName  string
++	Kind     string
++	Category string
++	ItemName string
++}, manifest []map[string]any) error {
++	zw := zip.NewWriter(w)
++	defer zw.Close()
++
++	for _, it := range images {
++		fw, err := zw.Create(it.ZipName)
++		if err != nil {
++			fmt.Printf("zip create failed for %s: %v\n", it.ZipName, err)
++			continue
++		}
++		if err := fetchToWriter(ctx, it.Src, fw); err != nil {
++			fmt.Printf("fetch failed for %s -> %s: %v\n", it.Src, it.ZipName, err)
++			continue
++		}
++	}
++
++	if manifest != nil {
++		mbytes, _ := json.MarshalIndent(manifest, "", "  ")
++		fm, err := zw.Create("manifest.json")
++		if err == nil {
++			_, _ = fm.Write(mbytes)
++		}
++	}
++
++	return nil
++}
++
++func (s *Server) handleExportMedia(w http.ResponseWriter, r *http.Request, claims jwt.MapClaims) {
++	if r.Method != http.MethodPost && r.Method != http.MethodGet {
++		http.Error(w, "only GET/POST allowed", http.StatusMethodNotAllowed)
++		return
++	}
++
++	id, err := getIDFromPath("/api/admin/export_media/", r.URL.Path)
++	if err != nil {
++		http.Error(w, "invalid restaurant id", http.StatusBadRequest)
++		return
++	}
++
++	role, _ := claims["role"].(string)
++	if role != "owner" {
++		http.Error(w, "forbidden - owner only", http.StatusForbidden)
++		return
++	}
++
++	var payload struct {
++		Target    string `json:"target"`
++		Bucket    string `json:"bucket"`
++		KeyPrefix string `json:"keyPrefix"`
++		Public    bool   `json:"public"`
++	}
++	if r.Method == http.MethodPost {
++		_ = json.NewDecoder(r.Body).Decode(&payload)
++	}
++
++	ctx := r.Context()
++	data, err := s.store.LoadRestaurantData(ctx, id)
++	if err != nil {
++		http.Error(w, "failed to load data", http.StatusInternalServerError)
++		return
++	}
++
++	type imgEntry struct {
++		Src      string
++		ZipName  string
++		Kind     string
++		Category string
++		ItemName string
++	}
++	seen := map[string]bool{}
++	var images []imgEntry
++	var manifest []map[string]any
++	idx := 0
++	for _, cat := range data.Menus {
++		for _, it := range cat.Items {
++			if strings.TrimSpace(it.Img) == "" {
++				continue
++			}
++			src := it.Img
++			if seen[src] {
++				continue
++			}
++			idx++
++			zn := createZipEntryName("menu", cat.Category, it.Name, src, idx)
++			images = append(images, imgEntry{Src: src, ZipName: zn, Kind: "menu", Category: cat.Category, ItemName: it.Name})
++			manifest = append(manifest, map[string]any{
++				"zip":      zn,
++				"source":   src,
++				"kind":     "menu",
++				"category": cat.Category,
++				"itemName": it.Name,
++			})
++			seen[src] = true
++		}
++	}
++	for gi, g := range data.Galleries.Images {
++		if strings.TrimSpace(g) == "" {
++			continue
++		}
++		if seen[g] {
++			continue
++		}
++		idx++
++		zn := createZipEntryName("gallery", "", "", g, gi+1)
++		images = append(images, imgEntry{Src: g, ZipName: zn, Kind: "gallery"})
++		manifest = append(manifest, map[string]any{
++			"zip":    zn,
++			"source": g,
++			"kind":   "gallery",
++		})
++		seen[g] = true
++	}
++
++	if len(images) == 0 {
++		http.Error(w, "no images found", http.StatusNotFound)
++		return
++	}
++
++	if strings.ToLower(payload.Target) == "s3" && payload.Bucket != "" {
++		keyPrefix := strings.TrimSpace(payload.KeyPrefix)
++		if keyPrefix != "" && !strings.HasSuffix(keyPrefix, "/") {
++			keyPrefix += "/"
++		}
++		key := fmt.Sprintf("%srestaurant_%d_media_%s.zip", keyPrefix, id, time.Now().Format("20060102T150405"))
++
++		awsCfg, err := config.LoadDefaultConfig(ctx)
++		if err != nil {
++			http.Error(w, "failed to load AWS config", http.StatusInternalServerError)
++			return
++		}
++		s3client := s3.NewFromConfig(awsCfg)
++		uploader := manager.NewUploader(s3client)
++
++		pr, pw := io.Pipe()
++		go func() {
++			defer pw.Close()
++			var imgs []struct {
++				Src      string
++				ZipName  string
++				Kind     string
++				Category string
++				ItemName string
++			}
++			for _, it := range images {
++				imgs = append(imgs, struct {
++					Src      string
++					ZipName  string
++					Kind     string
++					Category string
++					ItemName string
++				}{Src: it.Src, ZipName: it.ZipName, Kind: it.Kind, Category: it.Category, ItemName: it.ItemName})
++			}
++			if err := s.writeZipStream(ctx, pw, imgs, manifest); err != nil {
++				fmt.Println("error writing zip to pipe:", err)
++				_ = pw.CloseWithError(err)
++			}
++		}()
++
++		putInput := &s3.PutObjectInput{
++			Bucket: &payload.Bucket,
++			Key:    &key,
++		}
++		if payload.Public {
++			acl := "public-read"
++			putInput.ACL = s3.ObjectCannedACL(acl)
++		}
++
++		_, err = uploader.Upload(ctx, &s3.PutObjectInput{
++			Bucket: putInput.Bucket,
++			Key:    putInput.Key,
++			Body:   pr,
++			ACL:    putInput.ACL,
++		})
++		if err != nil {
++			http.Error(w, "failed to upload to S3: "+err.Error(), http.StatusInternalServerError)
++			return
++		}
++
++		presigner := s3.NewPresignClient(s3client)
++		getInput := &s3.GetObjectInput{
++			Bucket: &payload.Bucket,
++			Key:    &key,
++		}
++		presignCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
++		defer cancel()
++		presignRes, err := presigner.PresignGetObject(presignCtx, getInput, s3.WithPresignExpires(24*time.Hour))
++		if err != nil {
++			_ = insertAuditLog(ctx, s.store.DB, id, claims["email"].(string), "export_media_s3", map[string]any{"bucket": payload.Bucket, "key": key, "count": len(images)}, r.RemoteAddr)
++			writeJSON(w, map[string]any{"ok": true, "s3": fmt.Sprintf("s3://%s/%s", payload.Bucket, key)})
++			return
++		}
++
++		_ = insertAuditLog(ctx, s.store.DB, id, claims["email"].(string), "export_media_s3", map[string]any{"bucket": payload.Bucket, "key": key, "count": len(images)}, r.RemoteAddr)
++		writeJSON(w, map[string]any{"ok": true, "url": presignRes.URL})
++		return
++	}
++
++	filename := fmt.Sprintf("restaurant_%d_media_%s.zip", id, time.Now().Format("20060102T150405"))
++	w.Header().Set("Content-Type", "application/zip")
++	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
++
++	var imgs []struct {
++		Src      string
++		ZipName  string
++		Kind     string
++		Category string
++		ItemName string
++	}
++	for _, it := range images {
++		imgs = append(imgs, struct {
++			Src      string
++			ZipName  string
++			Kind     string
++			Category string
++			ItemName string
++		}{Src: it.Src, ZipName: it.ZipName, Kind: it.Kind, Category: it.Category, ItemName: it.ItemName})
++	}
++
++	if err := s.writeZipStream(ctx, w, imgs, manifest); err != nil {
++		fmt.Println("zip stream error:", err)
++	}
++	_ = insertAuditLog(ctx, s.store.DB, id, claims["email"].(string), "export_media_download", map[string]any{"count": len(images)}, r.RemoteAddr)
++}
+*** End Patch
+*** Begin Patch
+*** Add File: frontend/package.json
++{
++  "name": "restaurant-frontend",
++  "version": "1.0.0",
++  "private": true,
++  "dependencies": {
++    "react": "^18.2.0",
++    "react-dom": "^18.2.0",
++    "react-router-dom": "^6.14.1",
++    "axios": "^1.4.0"
++  },
++  "scripts": {
++    "start": "react-scripts start",
++    "build": "react-scripts build",
++    "export": "react-scripts build"
++  }
++}
+*** End Patch
+*** Begin Patch
+*** Add File: frontend/src/api.js
++import axios from "axios";
++
++const API = axios.create({
++  baseURL: process.env.REACT_APP_API_URL || "http://localhost:8080/api",
++  withCredentials: true,
++});
++
++export function fetchRestaurant(id) {
++  return API.get(`/restaurants/${id}`).then(r => r.data);
++}
++
++export function postOrder(restaurantId, payload) {
++  return API.post(`/orders/${restaurantId}`, payload).then(r => r.data);
++}
++
++export function postSubscribe(restaurantId, email) {
++  return API.post(`/subscribe/${restaurantId}`, { email }).then(r => r.data);
++}
++
++export function postReview(restaurantId, review) {
++  return API.post(`/reviews/${restaurantId}`, review).then(r => r.data);
++}
++
++export function login(restaurantId, email, password) {
++  return API.post("/login", { restaurantId, email, password }).then(r => r.data);
++}
++
++export function verify(token) {
++  return API.get("/verify", { headers: { Authorization: "Bearer " + token } }).then(r => r.data);
++}
++
++export function adminGetOrders(restaurantId, token) {
++  return API.get(`/admin/orders/${restaurantId}`, { headers: { Authorization: "Bearer " + token } }).then(r => r.data);
++}
++export function adminUpdateMenus(restaurantId, payload, token) {
++  return API.post(`/menus/${restaurantId}`, payload, { headers: { Authorization: "Bearer " + token } }).then(r => r.data);
++}
++export function adminPatchRestaurant(restaurantId, payload, token) {
++  return API.post(`/restaurants_patch/${restaurantId}`, payload, { headers: { Authorization: "Bearer " + token } }).then(r => r.data);
++}
++
++export function adminInvite(restaurantId, email, role, token) {
++  return API.post(`/admin/invite/${restaurantId}`, { email, role }, { headers: { Authorization: "Bearer " + token } }).then(r => r.data);
++}
++export function acceptInvite(tokenStr, password) {
++  return API.post(`/admin/invite/accept`, { token: tokenStr, password }).then(r => r.data);
++}
++
++export function requestPasswordReset(restaurantId, email) {
++  return API.post(`/admin/password_reset/request`, { restaurantId, email }).then(r => r.data);
++}
++export function confirmPasswordReset(token, password) {
++  return API.post(`/admin/password_reset/confirm`, { token, password }).then(r => r.data);
++}
++
++export function refreshSession() {
++  return API.post("/refresh").then(r => r.data);
++}
++export function logout() {
++  return API.post("/logout").then(r => r.data);
++}
++
++export function adminGetAudit(restaurantId, token) {
++  return API.get(`/admin/audit/${restaurantId}`, { headers: { Authorization: "Bearer " + token } }).then(r => r.data);
++}
++
++export function adminGetSessions(restaurantId, token) {
++  return API.get(`/admin/sessions/${restaurantId}`, { headers: { Authorization: "Bearer " + token } }).then(r => r.data);
++}
++export function adminRevokeSession(sessionId, token) {
++  return API.post(`/admin/sessions/revoke`, { sessionId }, { headers: { Authorization: "Bearer " + token } }).then(r => r.data);
++}
++export function adminRevokeOtherSessions(token) {
++  return API.post(`/admin/sessions/revoke_all`, {}, { headers: { Authorization: "Bearer " + token } }).then(r => r.data);
++}
++
++export function adminExportData(restaurantId, token) {
++  return API.get(`/admin/export/${restaurantId}`, { headers: { Authorization: "Bearer " + token }, responseType: "blob" }).then(r => r.data);
++}
++export function adminExportMedia(restaurantId, token) {
++  return API.get(`/admin/export_media/${restaurantId}`, { headers: { Authorization: "Bearer " + token }, responseType: "blob" }).then(r => r.data);
++}
++export function adminExportMediaToS3(restaurantId, payload, token) {
++  return API.post(`/admin/export_media/${restaurantId}`, payload, { headers: { Authorization: "Bearer " + token } }).then(r => r.data);
++}
++
++export default API;
+*** End Patch
+*** Begin Patch
+*** Add File: frontend/src/pages/ActiveSessions.jsx
++import React from "react";
++
++export default function ActiveSessions({ sessions = [], currentSessionId, onRevoke }) {
++  if (!sessions || sessions.length === 0) {
++    return <div>No active sessions</div>;
++  }
++  return (
++    <div>
++      {sessions.map(s => (
++        <div key={s.id} style={{ borderBottom: "1px solid #eee", padding: 8, background: s.id === currentSessionId ? "#f6ffed" : "transparent" }}>
++          <div>
++            <strong>{s.adminEmail}</strong>
++            {s.id === currentSessionId && <span style={{ marginLeft: 8, color: "#167a00", fontWeight: "600" }}>(This session)</span>}
++          </div>
++          <div>Created: {new Date(s.createdAt).toLocaleString()}</div>
++          <div>Expires: {s.expiresAt ? new Date(s.expiresAt).toLocaleString() : "none"}</div>
++          <div>IP: {s.ip || "—"} | UA: <small>{s.userAgent}</small></div>
++          <div>Status: {s.revoked ? "revoked" : "active"}</div>
++          <div style={{ marginTop: 6 }}>
++            {!s.revoked && s.id !== currentSessionId ? <button onClick={() => onRevoke(s.id)}>Revoke</button> : null}
++          </div>
++        </div>
++      ))}
++    </div>
++  );
++}
+*** End Patch
+*** Begin Patch
+*** Add File: frontend/src/pages/InviteAccept.jsx
++import React, { useEffect, useState } from "react";
++import { useSearchParams, useNavigate } from "react-router-dom";
++import { acceptInvite } from "../api";
++
++export default function InviteAccept() {
++  const [params] = useSearchParams();
++  const token = params.get("token");
++  const restaurantId = params.get("restaurantId");
++  const [password, setPassword] = useState("");
++  const [confirm, setConfirm] = useState("");
++  const [status, setStatus] = useState("");
++  const navigate = useNavigate();
++
++  useEffect(() => {
++    if (!token) {
++      setStatus("Invalid invite link.");
++    }
++  }, [token]);
++
++  const submit = async () => {
++    if (!token) return setStatus("Missing token");
++    if (password.length < 8) return setStatus("Password must be at least 8 characters");
++    if (password !== confirm) return setStatus("Passwords do not match");
++    setStatus("Submitting...");
++    try {
++      await acceptInvite(token, password);
++      setStatus("Account created. Redirecting to login...");
++      setTimeout(() => {
++        navigate(`/restaurant/${restaurantId}/admin`);
++      }, 1200);
++    } catch (e) {
++      console.error(e);
++      setStatus("Failed to accept invite. The token may be invalid or expired.");
++    }
++  };
++
++  return (
++    <div style={{ padding: 20 }}>
++      <h2>Accept Invitation</h2>
++      {!token ? <div>Invalid invitation link</div> : (
++        <div>
++          <div>
++            <input type="password" placeholder="Create password" value={password} onChange={e => setPassword(e.target.value)} />
++          </div>
++          <div>
++            <input type="password" placeholder="Confirm password" value={confirm} onChange={e => setConfirm(e.target.value)} />
++          </div>
++          <div>
++            <button onClick={submit}>Create account</button>
++          </div>
++          <div style={{ marginTop: 12 }}>{status}</div>
++        </div>
++      )}
++    </div>
++  );
++}
+*** End Patch
+*** Begin Patch
+*** Add File: frontend/src/pages/PasswordResetRequest.jsx
++import React, { useState } from "react";
++import { requestPasswordReset } from "../api";
++
++export default function PasswordResetRequest() {
++  const [restaurantId, setRestaurantId] = useState(process.env.REACT_APP_DEFAULT_RESTAURANT || "1");
++  const [email, setEmail] = useState("");
++  const [status, setStatus] = useState("");
++
++  const submit = async () => {
++    if (!email) return setStatus("Enter your email");
++    setStatus("Sending reset email...");
++    try {
++      await requestPasswordReset(parseInt(restaurantId, 10), email);
++      setStatus("If that email exists, a reset link has been sent.");
++    } catch (e) {
++      console.error(e);
++      setStatus("Failed to request reset (try again later).");
++    }
++  };
++
++  return (
++    <div style={{ padding: 20 }}>
++      <h2>Reset admin password</h2>
++      <div>
++        <label>Restaurant ID</label><br/>
++        <input value={restaurantId} onChange={e => setRestaurantId(e.target.value)} />
++      </div>
++      <div>
++        <label>Admin Email</label><br/>
++        <input value={email} onChange={e => setEmail(e.target.value)} />
++      </div>
++      <div style={{ marginTop: 12 }}>
++        <button onClick={submit}>Send password reset link</button>
++      </div>
++      <div style={{ marginTop: 12 }}>{status}</div>
++    </div>
++  );
++}
+*** End Patch
+*** Begin Patch
+*** Add File: frontend/src/pages/PasswordResetConfirm.jsx
++import React, { useEffect, useState } from "react";
++import { useSearchParams, useNavigate } from "react-router-dom";
++import { confirmPasswordReset } from "../api";
++
++export default function PasswordResetConfirm() {
++  const [params] = useSearchParams();
++  const token = params.get("token");
++  const restaurantId = params.get("restaurantId");
++  const [password, setPassword] = useState("");
++  const [confirm, setConfirm] = useState("");
++  const [status, setStatus] = useState("");
++  const navigate = useNavigate();
++
++  useEffect(() => {
++    if (!token) setStatus("Invalid reset link");
++  }, [token]);
++
++  const submit = async () => {
++    if (!token) return setStatus("Missing token");
++    if (password.length < 8) return setStatus("Password must be at least 8 characters");
++    if (password !== confirm) return setStatus("Passwords do not match");
++    setStatus("Submitting...");
++    try {
++      await confirmPasswordReset(token, password);
++      setStatus("Password set. Redirecting to admin login...");
++      setTimeout(() => {
++        navigate(`/restaurant/${restaurantId}/admin`);
++      }, 1200);
++    } catch (e) {
++      console.error(e);
++      setStatus("Failed to reset password. The token may be invalid or expired.");
++    }
++  };
++
++  return (
++    <div style={{ padding: 20 }}>
++      <h2>Set a new password</h2>
++      {!token ? <div>Invalid link</div> : (
++        <div>
++          <div><input type="password" placeholder="New password" value={password} onChange={e => setPassword(e.target.value)} /></div>
++          <div><input type="password" placeholder="Confirm password" value={confirm} onChange={e => setConfirm(e.target.value)} /></div>
++          <div style={{ marginTop: 12 }}><button onClick={submit}>Set password</button></div>
++          <div style={{ marginTop: 12 }}>{status}</div>
++        </div>
++      )}
++    </div>
++  );
++}
+*** End Patch
+*** Begin Patch
+*** Add File: frontend/src/components/LoginModal.jsx
++import React, { useState } from "react";
++import { login } from "../api";
++
++export default function LoginModal({ restaurantId, onLogin }) {
++  const [email, setEmail] = useState("");
++  const [password, setPassword] = useState("");
++  const [err, setErr] = useState("");
++
++  const submit = async () => {
++    try {
++      const res = await login(restaurantId, email, password);
++      onLogin({ accessToken: res.token, role: res.role, currentSessionId: res.currentSessionId });
++    } catch (e) {
++      setErr("Login failed");
++    }
++  };
++
++  return (
++    <div style={{ padding: 12 }}>
++      <h3>Admin Login</h3>
++      <div><input placeholder="email" value={email} onChange={e => setEmail(e.target.value)} /></div>
++      <div><input placeholder="password" type="password" value={password} onChange={e => setPassword(e.target.value)} /></div>
++      <button onClick={submit}>Login</button>
++      {err && <div style={{color:'red'}}>{err}</div>}
++    </div>
++  );
++}
+*** End Patch
+*** Begin Patch
+*** Add File: frontend/src/pages/Admin.jsx
++// NOTE: Full Admin.jsx content is provided earlier in the bundle. Ensure you place that complete file here.
+*** End Patch
+*** End Patch

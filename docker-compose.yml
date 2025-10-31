@@ -1,0 +1,57 @@
+version: "3.8"
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: resto
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./db:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      - DATABASE_URL=postgres://postgres:postgres@db:5432/resto?sslmode=disable
+      - JWT_SECRET=some-dev-secret
+      - FRONTEND_URL=http://localhost:3000
+      - ALLOW_ORIGIN=http://localhost:3000
+      - ENV=development
+      - ALLOW_INSECURE_COOKIES=1
+      - IMG_ROOT=/app/frontend/public
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+    volumes:
+      - ./frontend/public:/app/frontend/public:ro
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      - REACT_APP_API_URL=http://localhost:8080/api
+      - REACT_APP_DEFAULT_RESTAURANT=1
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  cleanup-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      - DATABASE_URL=postgres://postgres:postgres@db:5432/resto?sslmode=disable
+    depends_on:
+      - db
+    restart: unless-stopped
+
+volumes:
+  db-data:
