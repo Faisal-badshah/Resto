@@ -246,3 +246,4 @@ For issues, please open a GitHub issue with:
 - Error messages
 - Steps to reproduce
 - Environment details (OS, Go version, etc.)
+

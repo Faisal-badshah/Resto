@@ -62,21 +62,19 @@ def parse_patch(patch_path):
         for line_num, raw_line in enumerate(f, 1):
             line = raw_line.rstrip("\n")
             
-            # Detect "*** Add File:" marker
+
             if line.startswith("*** Add File:"):
-                # Flush previous file if any
+
                 if in_file and current_file:
                     write_file(current_file, current_lines)
                     files_written += 1
                 
-                # Extract new file path
                 path = line.split(":", 1)[1].strip()
                 current_file = path
                 current_lines = []
                 in_file = True
                 continue
             
-            # Detect "*** End Patch" marker
             if line.startswith("*** End Patch"):
                 if in_file and current_file:
                     write_file(current_file, current_lines)
@@ -97,6 +95,14 @@ def parse_patch(patch_path):
                 current_lines.append(content_line)
 
     # Flush last file if still open
+
+            if in_file and current_file:
+                if line.startswith("+"):
+                    content_line = line[1:] + "\n"
+                else:
+                    content_line = line + "\n"
+                current_lines.append(content_line)
+
     if in_file and current_file:
         write_file(current_file, current_lines)
         files_written += 1
@@ -137,6 +143,7 @@ def check_missing_files():
         return True
     return False
 
+
 def print_next_steps():
     """Print next steps for the user."""
     print("\n📋 Next Steps:")
@@ -161,7 +168,6 @@ def main():
     
     patch_path = sys.argv[1]
     
-    # Confirm action
     print("🔧 Restaurant Site Patch Applier")
     print("="*60)
     print(f"This will create/overwrite files from: {patch_path}")
@@ -176,4 +182,7 @@ def main():
     print_next_steps()
 
 if __name__ == "__main__":
+
     main()
+    main()
+
